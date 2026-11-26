@@ -1,0 +1,10 @@
+.git
+.gitignore
+.mlai
+.env
+.env.*
+*.md
+.github
+Dockerfile
+docker-compose.yml
+migrations
