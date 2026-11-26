@@ -18,8 +18,10 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 FROM alpine:3.22
 
 # Run as an unprivileged user; no shell access needed at runtime beyond busybox.
-RUN addgroup -S app && adduser -S -G app -u 10001 app \
-    && apk add --no-cache ca-certificates
+RUN apk upgrade --no-cache \
+    && apk add --no-cache ca-certificates \
+    && addgroup -S app \
+    && adduser -S -G app -u 10001 app
 
 COPY --from=builder --chown=app:app /out/server /usr/local/bin/server
 

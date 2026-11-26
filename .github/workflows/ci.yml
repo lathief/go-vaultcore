@@ -81,6 +81,7 @@ jobs:
           severity: CRITICAL,HIGH
 
       - name: Scan image (report all findings to code scanning)
+        if: ${{ !cancelled() }}
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: go-vaultcore-api:ci
