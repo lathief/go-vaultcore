@@ -5,6 +5,7 @@ services:
     restart: unless-stopped
     environment:
       PORT: "8080"
+      API_TOKEN: "${API_TOKEN:?Set API_TOKEN before starting Compose}"
       DATABASE_URL: "${DATABASE_URL:-root:root@tcp(mysql:3306)/app?parseTime=true&interpolateParams=true&charset=utf8mb4}"
     ports:
       - "8080:8080"
@@ -27,6 +28,7 @@ services:
     volumes:
       - mysqldata:/var/lib/mysql
       - ./migrations/0001_schema.up.sql:/docker-entrypoint-initdb.d/0001_schema.sql:ro
+      - ./migrations/0002_idempotency_claim_token.up.sql:/docker-entrypoint-initdb.d/0002_idempotency_claim_token.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$${MYSQL_ROOT_PASSWORD} --silent"]
       interval: 5s

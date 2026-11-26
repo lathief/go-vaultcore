@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"math"
 	"sync"
 	"testing"
 
@@ -93,6 +94,73 @@ func TestBasicTransfer(t *testing.T) {
 	var rerr *KeyReusedError
 	if !errors.As(err, &rerr) {
 		t.Fatalf("expected key reuse error, got %v", err)
+	}
+}
+
+func TestExpiredProcessingClaimCanBeReclaimedAndFenced(t *testing.T) {
+	db := openDB(t)
+	s := &Service{DB: db}
+	ctx := context.Background()
+	src := mustAccount(t, s, 1, 10_000)
+	dst := mustAccount(t, s, 2, 0)
+	req := Request{SourceAccountID: src, DestinationAccountID: dst, AmountCents: 1_000}
+
+	oldToken, err := s.claimKey(ctx, "expired-key", req)
+	if err != nil {
+		t.Fatalf("initial claim: %v", err)
+	}
+	if _, err := db.Exec(`UPDATE idempotency_keys
+		SET expires_at=DATE_SUB(NOW(6), INTERVAL 1 SECOND)
+		WHERE scope='transfer' AND idem_key=?`, "expired-key"); err != nil {
+		t.Fatalf("expire initial claim: %v", err)
+	}
+	newToken, err := s.claimKey(ctx, "expired-key", req)
+	if err != nil {
+		t.Fatalf("reclaim expired key: %v", err)
+	}
+	if oldToken == newToken {
+		t.Fatal("reclaimed claim reused the old fencing token")
+	}
+
+	_, err = s.runTransfer(ctx, "expired-key", oldToken, req)
+	var conflict *ConflictError
+	if !errors.As(err, &conflict) {
+		t.Fatalf("old claim should be fenced out, got %v", err)
+	}
+	if got := balance(t, s, src); got != 10_000 {
+		t.Fatalf("stale claim changed source balance: %d", got)
+	}
+
+	if _, err := s.runTransfer(ctx, "expired-key", newToken, req); err != nil {
+		t.Fatalf("transfer with reclaimed claim: %v", err)
+	}
+	if got := balance(t, s, src); got != 9_000 {
+		t.Fatalf("source balance = %d, want 9000", got)
+	}
+}
+
+func TestCheckedBalanceAdd(t *testing.T) {
+	tests := []struct {
+		name    string
+		balance int64
+		amount  int64
+		want    int64
+		wantErr bool
+	}{
+		{name: "normal addition", balance: 10, amount: 5, want: 15},
+		{name: "maximum balance", balance: math.MaxInt64 - 1, amount: 1, want: math.MaxInt64},
+		{name: "overflow", balance: math.MaxInt64, amount: 1, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := checkedBalanceAdd(tt.balance, tt.amount)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("error = %v, wantErr %t", err, tt.wantErr)
+			}
+			if err == nil && got != tt.want {
+				t.Fatalf("balance = %d, want %d", got, tt.want)
+			}
+		})
 	}
 }
 

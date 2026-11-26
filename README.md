@@ -39,9 +39,10 @@ Returns the plain-text response `ok`.
 
 ### `POST /transfers`
 
-Requires an `Idempotency-Key` header and a JSON body:
+Requires a bearer token, an `Idempotency-Key` header, and a JSON body:
 
 ```http
+Authorization: Bearer <API_TOKEN>
 Idempotency-Key: transfer-123
 Content-Type: application/json
 ```
@@ -58,6 +59,7 @@ Content-Type: application/json
 |---|---|
 | `201` | Transfer created |
 | `200` | Completed request replayed; no second transfer is executed |
+| `401` | Missing or invalid bearer token |
 | `400` | Malformed JSON or an unknown JSON field |
 | `409` | Idempotency key is in progress or was reused with a different payload |
 | `422` | Validation, account, currency, or insufficient-funds error |
@@ -73,19 +75,25 @@ Errors produced by the transfer handler use this envelope:
 
 ## Running locally
 
-Requirements: Go 1.24 or newer and MySQL 8 (or a compatible MariaDB version).
+Requirements: Go 1.24 or newer, MySQL 8 (or a compatible MariaDB version), and
+an API token.
 The Go version declared by the module is in `go.mod`.
 
-Create the database and apply the schema:
+For a new database, create it and apply both migrations in order:
 
 ```sh
 mysql -uroot -proot -e "CREATE DATABASE IF NOT EXISTS app"
 mysql -uroot -proot app < migrations/0001_schema.up.sql
+mysql -uroot -proot app < migrations/0002_idempotency_claim_token.up.sql
 ```
+
+For an existing database created with migration `0001`, apply only migration
+`0002`.
 
 Then run the server:
 
 ```sh
+export API_TOKEN='replace-with-a-long-random-secret'
 export DATABASE_URL='root:root@tcp(127.0.0.1:3306)/app?parseTime=true&interpolateParams=true&charset=utf8mb4'
 export PORT=8080
 
@@ -94,6 +102,7 @@ go run ./cmd/server
 
 | Variable | Default | Description |
 |---|---|---|
+| `API_TOKEN` | — | Required bearer token for `POST /transfers` |
 | `DATABASE_URL` | `root:root@tcp(127.0.0.1:3306)/app?parseTime=true&interpolateParams=true&charset=utf8mb4` | MySQL DSN |
 | `PORT` | `8080` | HTTP listen port |
 
@@ -107,9 +116,9 @@ go build ./... && go vet ./... && go test ./... -count=1
 ```
 
 The transfer tests require MySQL at
-`root:root@tcp(127.0.0.1:3306)/app` with the schema applied. They truncate the
-application tables, so use a disposable test database, not a database containing
-data you need to keep.
+`root:root@tcp(127.0.0.1:3306)/app` with both migrations applied. They truncate
+the application tables, so use a disposable test database, not a database
+containing data you need to keep.
 
 `TestConcurrentBidirectionalStress` starts 50 A-to-B and 20 B-to-A transfers
 concurrently. It checks that money is conserved, balances stay non-negative,
@@ -120,30 +129,30 @@ caller.
 
 ```sh
 docker build -t go-vaultcore-api:local .
+export API_TOKEN='replace-with-a-long-random-secret'
 docker compose up --build
 ```
 
 The Compose stack starts `api` (port 8080), `mysql`, and `prometheus` (port
 9090). On first initialization of the MySQL data volume, MySQL loads
-`migrations/0001_schema.up.sql`; the API waits for MySQL's health check before
-starting. The API does not currently expose `/metrics`, so its Prometheus
-scrape target remains down.
+both migration scripts; the API waits for MySQL's health check before starting.
+An existing volume created before migration `0002` must be upgraded manually.
+The API does not currently expose `/metrics`, so its Prometheus scrape target
+remains down.
 
 ## CI
 
-The workflow at `.github/workflows/.ci.yml` is configured for pushes to `main`
-and pull requests. It builds, vets, and tests against a MySQL 8 service, then
-builds the Docker image and scans it with Trivy.
-
-The workflow currently does not apply `migrations/0001_schema.up.sql` to its
-MySQL service before running the database-backed tests. Those tests require the
-schema, so the CI database setup must apply the migration for the test job to
-pass.
+The workflow at `.github/workflows/ci.yml` is configured for pushes to `master`
+and pull requests. It builds and vets the Go packages, applies both migrations
+to its MySQL 8 service, and runs the tests. It then builds the Docker image and
+scans it with Trivy.
 
 ## Current limitations
 
-- The API does not implement authentication or authorization. Do not expose it
-  to untrusted callers or use it to manage real funds as-is.
-- Idempotency keys store a 24-hour `expires_at`, but the service does not
-  currently reclaim expired `processing` keys. A process interruption can
-  therefore leave a key unavailable for retry.
+- `API_TOKEN` is shared by all callers. It authenticates access to the transfer
+  endpoint but does not authorize transfers by account owner; any token holder
+  can submit transfers involving any account IDs. Do not use this service to
+  manage real funds without adding account-level authorization.
+- Expired `processing` idempotency claims can be reclaimed after 24 hours, with
+  a fencing token preventing an older operation from committing afterward.
+  Completed idempotency records are not automatically purged.

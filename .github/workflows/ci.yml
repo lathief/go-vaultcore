@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [master]
   pull_request:
 
 permissions:
@@ -40,6 +40,11 @@ jobs:
 
       - name: Vet
         run: go vet ./...
+
+      - name: Apply database migrations
+        run: |
+          mysql --host=127.0.0.1 --user=root --password=root app < migrations/0001_schema.up.sql
+          mysql --host=127.0.0.1 --user=root --password=root app < migrations/0002_idempotency_claim_token.up.sql
 
       - name: Test
         run: go test ./... -count=1

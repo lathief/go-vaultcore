@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -18,6 +19,12 @@ import (
 )
 
 func main() {
+	apiToken := strings.TrimSpace(os.Getenv("API_TOKEN"))
+	if apiToken == "" {
+		slog.Error("API_TOKEN is required")
+		os.Exit(1)
+	}
+
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
 		dsn = "root:root@tcp(127.0.0.1:3306)/app?parseTime=true&interpolateParams=true&charset=utf8mb4"
@@ -39,7 +46,11 @@ func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
 	mux := http.NewServeMux()
-	mux.Handle("POST /transfers", &httpapi.TransferHandler{Service: &transfer.Service{DB: db}, Logger: logger})
+	mux.Handle("POST /transfers", &httpapi.TransferHandler{
+		Service: &transfer.Service{DB: db},
+		Logger:  logger,
+		Token:   apiToken,
+	})
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
