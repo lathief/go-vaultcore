@@ -2,11 +2,13 @@ package transfer
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 )
 
 // Request is the validated input for a transfer.
@@ -16,8 +18,8 @@ type Request struct {
 	AmountCents          int64 `json:"amount_cents"`
 }
 
-// Result is the outcome of a transfer, persisted alongside the idempotency key
-// so replays return a consistent response.
+// Result is the response for a transfer. Replays return the original transfer
+// ID and the accounts' current balances.
 type Result struct {
 	TransferID         int64 `json:"transfer_id"`
 	SourceBalanceCents int64 `json:"source_balance_cents"`
@@ -72,8 +74,8 @@ type accountState struct {
 	Balance  int64
 }
 
-// Execute runs the whole transfer in one database transaction.
-// idemKey comes from the Idempotency-Key header.
+// Execute validates a transfer, claims its idempotency key, and runs it in a
+// database transaction. idemKey comes from the Idempotency-Key header.
 func (s *Service) Execute(ctx context.Context, idemKey string, req Request) (Result, bool, error) {
 	if idemKey == "" {
 		return Result{}, false, &ValidationError{Msg: "Idempotency-Key header is required"}
@@ -99,28 +101,26 @@ func (s *Service) Execute(ctx context.Context, idemKey string, req Request) (Res
 		return res, true, nil
 	}
 
-	// Claim the key. The unique index uq_idem makes this race-safe: only one
-	// concurrent request can insert; duplicates are a replay-in-progress or a
-	// key reuse with a different payload.
-	claimed, err := s.claimKey(ctx, idemKey, req)
+	claimToken, err := s.claimKey(ctx, idemKey, req)
 	if err != nil {
-		return Result{}, false, err
-	}
-	if !claimed {
 		if errors.Is(err, errCompleted) {
-			if res, ok, rerr := s.ReplayResult(ctx, idemKey); rerr == nil && ok {
+			res, ok, replayErr := s.ReplayResult(ctx, idemKey)
+			if replayErr != nil {
+				return Result{}, false, replayErr
+			}
+			if ok {
 				return res, true, nil
 			}
 			return Result{}, false, &ConflictError{Msg: "transfer with this Idempotency-Key already completed"}
 		}
-		return Result{}, false, &ConflictError{Msg: "request with this Idempotency-Key is already in progress or has a different payload"}
+		return Result{}, false, err
 	}
 
-	res, err := s.runTransfer(ctx, idemKey, req)
+	res, err := s.runTransfer(ctx, idemKey, claimToken, req)
 	if err != nil {
-		// Release the claim so a genuine retry can start over. Run even if the
-		// caller's request is cancelled mid-flight.
-		s.failKey(context.WithoutCancel(ctx), idemKey)
+		if releaseErr := s.failKey(context.WithoutCancel(ctx), idemKey, claimToken); releaseErr != nil {
+			return Result{}, false, fmt.Errorf("transfer failed (%v); release idempotency claim: %w", err, releaseErr)
+		}
 		return Result{}, false, err
 	}
 	return res, false, nil
@@ -142,13 +142,17 @@ func (s *Service) payloadMismatch(ctx context.Context, key string, req Request) 
 	return hash != requestHash(req), nil
 }
 
-func (s *Service) claimKey(ctx context.Context, key string, req Request) (bool, error) {
-	_, err := s.DB.ExecContext(ctx, `
-		INSERT INTO idempotency_keys (idem_key, scope, request_hash, state, expires_at)
-		VALUES (?, 'transfer', ?, 'processing', DATE_ADD(NOW(6), INTERVAL 24 HOUR))`,
-		key, requestHash(req))
-	if err == nil {
-		return true, nil
+func (s *Service) claimKey(ctx context.Context, key string, req Request) (string, error) {
+	token, err := newClaimToken()
+	if err != nil {
+		return "", err
+	}
+	_, insertErr := s.DB.ExecContext(ctx, `
+		INSERT INTO idempotency_keys (idem_key, scope, request_hash, state, expires_at, claim_token)
+		VALUES (?, 'transfer', ?, 'processing', DATE_ADD(NOW(6), INTERVAL 24 HOUR), ?)`,
+		key, requestHash(req), token)
+	if insertErr == nil {
+		return token, nil
 	}
 	var (
 		state string
@@ -158,44 +162,72 @@ func (s *Service) claimKey(ctx context.Context, key string, req Request) (bool, 
 		`SELECT state, request_hash FROM idempotency_keys WHERE scope='transfer' AND idem_key=?`,
 		key).Scan(&state, &hash)
 	if qerr != nil {
-		return false, &ConflictError{Msg: "idempotency key collision"}
+		if errors.Is(qerr, sql.ErrNoRows) {
+			return "", insertErr
+		}
+		return "", qerr
 	}
 	if hash != requestHash(req) {
-		return false, &KeyReusedError{}
+		return "", &KeyReusedError{}
 	}
 	if state == "completed" {
-		// A completed replay slipped past the fast path (e.g. right after
-		// commit); serve the stored result instead of a conflict.
-		return false, errCompleted
+		return "", errCompleted
 	}
-	// state == 'failed': a previous attempt released its claim, so this key is
-	// reclaimable. The conditional update keeps the race with other claimers safe.
-	res2, uerr := s.DB.ExecContext(ctx, `
+	res, err := s.DB.ExecContext(ctx, `
 		UPDATE idempotency_keys
-		SET state='processing', result_code=NULL, transfer_id=NULL,
-		    request_hash=?, expires_at=DATE_ADD(NOW(6), INTERVAL 24 HOUR)
-		WHERE scope='transfer' AND idem_key=? AND state='failed'`,
-		requestHash(req), key)
-	if uerr == nil {
-		if n, _ := res2.RowsAffected(); n == 1 {
-			return true, nil
-		}
+		SET state='processing', result_code=NULL, transfer_id=NULL, claim_token=?,
+		    expires_at=DATE_ADD(NOW(6), INTERVAL 24 HOUR)
+		WHERE scope='transfer' AND idem_key=? AND request_hash=?
+		  AND (state='failed' OR (state='processing' AND expires_at <= NOW(6)))`,
+		token, key, requestHash(req))
+	if err != nil {
+		return "", err
 	}
-	return false, &ConflictError{Msg: "request with this Idempotency-Key is already in progress"}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return "", err
+	}
+	if n == 1 {
+		return token, nil
+	}
+
+	err = s.DB.QueryRowContext(ctx,
+		`SELECT state, request_hash FROM idempotency_keys WHERE scope='transfer' AND idem_key=?`,
+		key).Scan(&state, &hash)
+	if err != nil {
+		return "", err
+	}
+	if hash != requestHash(req) {
+		return "", &KeyReusedError{}
+	}
+	if state == "completed" {
+		return "", errCompleted
+	}
+	return "", &ConflictError{Msg: "request with this Idempotency-Key is already in progress"}
 }
 
 var errCompleted = errors.New("idempotency key already completed")
 
-func (s *Service) failKey(ctx context.Context, key string) {
-	_, _ = s.DB.ExecContext(ctx,
-		`UPDATE idempotency_keys SET state='failed', result_code='error'
-		 WHERE scope='transfer' AND idem_key=? AND state='processing'`, key)
+func newClaimToken() (string, error) {
+	var token [16]byte
+	if _, err := rand.Read(token[:]); err != nil {
+		return "", fmt.Errorf("generate idempotency claim token: %w", err)
+	}
+	return hex.EncodeToString(token[:]), nil
+}
+
+func (s *Service) failKey(ctx context.Context, key, claimToken string) error {
+	_, err := s.DB.ExecContext(ctx,
+		`UPDATE idempotency_keys SET state='failed', result_code='error', claim_token=NULL
+		 WHERE scope='transfer' AND idem_key=? AND state='processing' AND claim_token=?`,
+		key, claimToken)
+	return err
 }
 
 // runTransfer does the money movement inside one transaction. Locking both
 // rows in ascending id order prevents the A<->B deadlock; the single commit
-// makes the debit, credit and idempotency claim atomic.
-func (s *Service) runTransfer(ctx context.Context, idemKey string, req Request) (Result, error) {
+// makes the debit, credit and idempotency completion atomic.
+func (s *Service) runTransfer(ctx context.Context, idemKey, claimToken string, req Request) (Result, error) {
 	var zero Result
 
 	tx, err := s.DB.BeginTx(ctx, nil)
@@ -241,6 +273,10 @@ func (s *Service) runTransfer(ctx context.Context, idemKey string, req Request) 
 	if src.Balance < req.AmountCents {
 		return zero, &InsufficientFundsError{}
 	}
+	dstNew, err := checkedBalanceAdd(dst.Balance, req.AmountCents)
+	if err != nil {
+		return zero, err
+	}
 
 	lr, err := tx.ExecContext(ctx,
 		`INSERT INTO transfers (amount_cents, currency) VALUES (?, ?)`,
@@ -254,7 +290,6 @@ func (s *Service) runTransfer(ctx context.Context, idemKey string, req Request) 
 	}
 
 	srcNew := src.Balance - req.AmountCents
-	dstNew := dst.Balance + req.AmountCents
 
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE accounts SET balance_cents=?, version=version+1 WHERE id=?`, srcNew, src.ID); err != nil {
@@ -273,12 +308,21 @@ func (s *Service) runTransfer(ctx context.Context, idemKey string, req Request) 
 	}
 
 	// Finalize the idempotency record inside the same transaction, so the
-	// claim and the money movement commit (or roll back) atomically.
-	if _, err := tx.ExecContext(ctx, `
+	// completion and the money movement commit (or roll back) atomically.
+	finalizeResult, err := tx.ExecContext(ctx, `
 		UPDATE idempotency_keys
-		SET state='completed', result_code='ok', transfer_id=?
-		WHERE scope='transfer' AND idem_key=?`, transferID, idemKey); err != nil {
+		SET state='completed', result_code='ok', transfer_id=?, claim_token=NULL
+		WHERE scope='transfer' AND idem_key=? AND state='processing' AND claim_token=?`,
+		transferID, idemKey, claimToken)
+	if err != nil {
 		return zero, err
+	}
+	updated, err := finalizeResult.RowsAffected()
+	if err != nil {
+		return zero, err
+	}
+	if updated != 1 {
+		return zero, &ConflictError{Msg: "idempotency claim expired before transfer completed"}
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -313,6 +357,16 @@ func (s *Service) ReplayResult(ctx context.Context, key string) (Result, bool, e
 		return Result{}, false, err
 	}
 	return Result{TransferID: transferID, SourceBalanceCents: sourceBalance, TargetBalanceCents: targetBalance}, true, nil
+}
+
+func checkedBalanceAdd(balance, amount int64) (int64, error) {
+	if amount > 0 && balance > math.MaxInt64-amount {
+		return 0, &ValidationError{Msg: "destination balance would overflow"}
+	}
+	if amount < 0 && balance < math.MinInt64-amount {
+		return 0, &ValidationError{Msg: "destination balance would overflow"}
+	}
+	return balance + amount, nil
 }
 
 // CreateAccount seeds an account (tests and fixtures).

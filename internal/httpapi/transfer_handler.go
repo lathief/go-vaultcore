@@ -1,10 +1,13 @@
 package httpapi
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/lathief/go-vaultcore/internal/transfer"
@@ -21,6 +24,7 @@ type errorEnvelope struct {
 type TransferHandler struct {
 	Service *transfer.Service
 	Logger  *slog.Logger
+	Token   string
 }
 
 func writeError(w http.ResponseWriter, status int, code, msg string) {
@@ -38,6 +42,11 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 }
 
 func (h *TransferHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if !h.authorized(r) {
+		w.Header().Set("WWW-Authenticate", "Bearer")
+		writeError(w, http.StatusUnauthorized, "unauthorized", "valid bearer token required")
+		return
+	}
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "use POST")
 		return
@@ -47,6 +56,10 @@ func (h *TransferHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_body", "malformed JSON body")
+		return
+	}
+	if err := dec.Decode(new(any)); !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, "invalid_body", "request body must contain exactly one JSON value")
 		return
 	}
 
@@ -66,6 +79,14 @@ func (h *TransferHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Idempotency-Replayed", replayedString(replayed))
 	writeJSON(w, status, res)
+}
+
+func (h *TransferHandler) authorized(r *http.Request) bool {
+	fields := strings.Fields(r.Header.Get("Authorization"))
+	if len(fields) != 2 || !strings.EqualFold(fields[0], "Bearer") {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(fields[1]), []byte(h.Token)) == 1
 }
 
 func replayedString(b bool) string {
@@ -90,7 +111,13 @@ func (h *TransferHandler) handleError(w http.ResponseWriter, r *http.Request, id
 		writeError(w, http.StatusConflict, "idempotency_key_reused", rerr2.Error())
 	case errors.As(err, &cerr):
 		// If the key actually completed, replay wins over the conflict.
-		if res, ok, rerr := h.Service.ReplayResult(r.Context(), idemKey); rerr == nil && ok {
+		res, ok, replayErr := h.Service.ReplayResult(r.Context(), idemKey)
+		if replayErr != nil {
+			h.Logger.Error("replay transfer after conflict", "error", replayErr, "idem_key", idemKey)
+			writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")
+			return
+		}
+		if ok {
 			w.Header().Set("Idempotency-Replayed", "true")
 			writeJSON(w, http.StatusOK, res)
 			return
